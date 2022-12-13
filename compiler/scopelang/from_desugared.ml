@@ -36,7 +36,7 @@ let tag_with_log_entry
     (l : log_entry)
     (markings : Uid.MarkedString.info list) : untyped Ast.expr boxed =
   Expr.eapp
-    (Expr.eop (Unop (Log (l, markings))) (Marked.get_mark e))
+    (Expr.eop (Log (l, markings)) [TAny, Expr.pos e] (Marked.get_mark e))
     [e] (Marked.get_mark e)
 
 let rec translate_expr (ctx : ctx) (e : Desugared.Ast.expr) :
@@ -128,9 +128,23 @@ let rec translate_expr (ctx : ctx) (e : Desugared.Ast.expr) :
         ctx (Array.to_list vars) (Array.to_list new_vars)
     in
     Expr.eabs (Expr.bind new_vars (translate_expr ctx body)) tys m
+  | EApp { f = EOp { op; tys }, m1; args } ->
+    let args = List.map (translate_expr ctx) args in
+    Operator.kind_dispatch op
+      ~monomorphic:(fun op -> Expr.eapp (Expr.eop op tys m1) args m)
+      ~polymorphic:(fun op -> Expr.eapp (Expr.eop op tys m1) args m)
+      ~overloaded:(fun op ->
+        match
+          Operator.resolve_overload ctx.decl_ctx
+            (Marked.mark (Expr.pos e) op)
+            tys
+        with
+        | op, `Straight -> Expr.eapp (Expr.eop op tys m1) args m
+        | op, `Reversed ->
+          Expr.eapp (Expr.eop op (List.rev tys) m1) (List.rev args) m)
+  | EOp _ -> assert false (* Only allowed within [EApp] *)
   | EApp { f; args } ->
     Expr.eapp (translate_expr ctx f) (List.map (translate_expr ctx) args) m
-  | EOp op -> Expr.eop (Expr.translate_op op) m
   | EDefault { excepts; just; cons } ->
     Expr.edefault
       (List.map (translate_expr ctx) excepts)
@@ -191,6 +205,7 @@ let def_map_to_tree
     when to place the toplevel binding in the case of functions. *)
 let rec rule_tree_to_expr
     ~(toplevel : bool)
+    ~(is_reentrant_var : bool)
     (ctx : ctx)
     (def_pos : Pos.t)
     (is_func : Desugared.Ast.expr Var.t option)
@@ -271,7 +286,9 @@ let rec rule_tree_to_expr
       emark
   in
   let exceptions =
-    List.map (rule_tree_to_expr ~toplevel:false ctx def_pos is_func) exceptions
+    List.map
+      (rule_tree_to_expr ~toplevel:false ~is_reentrant_var ctx def_pos is_func)
+      exceptions
   in
   let default =
     Expr.make_default exceptions
@@ -283,8 +300,13 @@ let rec rule_tree_to_expr
   | Some new_param, Some (_, typ) ->
     if toplevel then
       (* When we're creating a function from multiple defaults, we must check
-         that the result returned by the function is not empty *)
-      let default = Expr.eerroronempty default emark in
+         that the result returned by the function is not empty, unless we're
+         dealing with a context variable which is reentrant (either in the
+         caller or callee). In this case the ErrorOnEmpty will be added later in
+         the scopelang->dcalc translation. *)
+      let default =
+        if is_reentrant_var then default else Expr.eerroronempty default emark
+      in
       Expr.make_abs
         [| Var.Map.find new_param ctx.var_mapping |]
         default [typ] def_pos
@@ -348,6 +370,11 @@ let translate_def
     | OnlyInput -> true
     | _ -> false
   in
+  let is_reentrant =
+    match Marked.unmark io.Desugared.Ast.io_input with
+    | Reentrant -> true
+    | _ -> false
+  in
   let top_value =
     if is_cond && ((not is_subscope_var) || (is_subscope_var && is_input)) then
       (* We add the bottom [false] value for conditions, only for the scope
@@ -385,10 +412,14 @@ let translate_def
        will not be provided by the calee scope, it has to be placed in the
        caller. *)
   then
-    Expr.elit LEmptyError
-      (Untyped { pos = Desugared.Ast.ScopeDef.get_position def_info })
+    let m = Untyped { pos = Desugared.Ast.ScopeDef.get_position def_info } in
+    let empty_error = Expr.elit LEmptyError m in
+    match is_def_func_param_typ with
+    | Some ty ->
+      Expr.make_abs [| Var.make "_" |] empty_error [ty] (Expr.mark_pos m)
+    | _ -> empty_error
   else
-    rule_tree_to_expr ~toplevel:true ctx
+    rule_tree_to_expr ~toplevel:true ~is_reentrant_var:is_reentrant ctx
       (Desugared.Ast.ScopeDef.get_position def_info)
       (Option.map (fun _ -> Var.make "param") is_def_func_param_typ)
       (match top_list, top_value with
